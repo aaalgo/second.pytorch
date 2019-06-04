@@ -1,7 +1,10 @@
+import sys
 import pickle
 from pathlib import Path
 
 import numpy as np
+import fire
+import open3d
 
 from second.core import box_np_ops
 from second.data.dataset import Dataset, get_dataset_class
@@ -26,6 +29,7 @@ def create_groundtruth_database(dataset_class_name,
         info_path=info_path,
         root_path=data_path,
     )
+    print("LEN:", dataset.__len__)
     root_path = Path(data_path)
     if database_save_path is None:
         database_save_path = root_path / 'gt_database'
@@ -66,6 +70,8 @@ def create_groundtruth_database(dataset_class_name,
             gt_points[:, :3] -= gt_boxes[i, :3]
             with open(filepath, 'w') as f:
                 gt_points.tofile(f)
+            #print(filepath, gt_points.shape, gt_points.dtype)
+            #sys.exit(0)
             if (used_classes is None) or names[i] in used_classes:
                 if relative_path:
                     db_path = str(database_save_path.stem + "/" + filename)
@@ -187,3 +193,6 @@ def create_groundtruth_database_parallel(dataset_class_name,
 
     with open(db_info_save_path, 'wb') as f:
         pickle.dump(all_db_infos, f)
+
+if __name__ == "__main__":
+    fire.Fire()

@@ -8,6 +8,7 @@ import time
 import re 
 import fire
 import numpy as np
+import open3d
 import torch
 from google.protobuf import text_format
 
@@ -144,7 +145,7 @@ def train(config_path,
     """train a VoxelNet model specified by a config file.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     model_dir = str(Path(model_dir).resolve())
     if create_folder:
         if Path(model_dir).exists():
@@ -252,12 +253,14 @@ def train(config_path,
         voxel_generator=voxel_generator,
         target_assigner=target_assigner,
         multi_gpu=multi_gpu)
+    '''
     eval_dataset = input_reader_builder.build(
         eval_input_cfg,
         model_cfg,
         training=False,
         voxel_generator=voxel_generator,
         target_assigner=target_assigner)
+    '''
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -268,6 +271,7 @@ def train(config_path,
         collate_fn=collate_fn,
         worker_init_fn=_worker_init_fn,
         drop_last=not multi_gpu)
+    '''
     eval_dataloader = torch.utils.data.DataLoader(
         eval_dataset,
         batch_size=eval_input_cfg.batch_size, # only support multi-gpu train
@@ -275,13 +279,14 @@ def train(config_path,
         num_workers=eval_input_cfg.preprocess.num_workers,
         pin_memory=False,
         collate_fn=merge_second_batch)
+    '''
 
     ######################
     # TRAINING
     ######################
     model_logging = SimpleModelLog(model_dir)
     model_logging.open()
-    model_logging.log_text(proto_str + "\n", 0, tag="config")
+    #model_logging.log_text(proto_str + "\n", 0, tag="config")
     start_step = net.get_global_step()
     total_step = train_cfg.steps
     t = time.time()
@@ -379,6 +384,7 @@ def train(config_path,
                 if global_step % steps_per_eval == 0:
                     torchplus.train.save_models(model_dir, [net, amp_optimizer],
                                                 net.get_global_step())
+                    '''
                     net.eval()
                     result_path_step = result_path / f"step_{net.get_global_step()}"
                     result_path_step.mkdir(parents=True, exist_ok=True)
@@ -412,6 +418,7 @@ def train(config_path,
                     with open(result_path_step / "result.pkl", 'wb') as f:
                         pickle.dump(detections, f)
                     net.train()
+                    '''
                 step += 1
                 if step >= total_step:
                     break
@@ -656,6 +663,125 @@ def helper_tune_target_assigner(config_path, target_rate=None, update_freq=200, 
 def mcnms_parameters_search(config_path,
           model_dir,
           preds_path):
+    pass
+
+def inference(config_path,
+             model_dir=None,
+             info_path=None,
+             result_path=None,
+             ckpt_path=None,
+             measure_time=False,
+             batch_size=None,
+             **kwargs):
+    """Don't support pickle_result anymore. if you want to generate kitti label file,
+    please use kitti_anno_to_label_file and convert_detection_to_kitti_annos
+    in second.data.kitti_dataset.
+    """
+    assert len(kwargs) == 0
+    model_dir = str(Path(model_dir).resolve())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    result_name = 'eval_results'
+    if result_path is None:
+        model_dir = Path(model_dir)
+        result_path = model_dir / result_name
+    else:
+        result_path = Path(result_path)
+    if isinstance(config_path, str):
+        # directly provide a config object. this usually used
+        # when you want to eval with several different parameters in
+        # one script.
+        config = pipeline_pb2.TrainEvalPipelineConfig()
+        with open(config_path, "r") as f:
+            proto_str = f.read()
+            text_format.Merge(proto_str, config)
+    else:
+        config = config_path
+
+    input_cfg = config.eval_input_reader
+    if not info_path is None:
+        input_cfg.dataset.kitti_info_path = info_path
+
+    model_cfg = config.model.second
+    train_cfg = config.train_config
+
+    net = build_network(model_cfg, measure_time=measure_time).to(device)
+    if train_cfg.enable_mixed_precision:
+        net.half()
+        print("half inference!")
+        net.metrics_to_float()
+        net.convert_norm_to_float(net)
+    target_assigner = net.target_assigner
+    voxel_generator = net.voxel_generator
+
+    if ckpt_path is None:
+        assert model_dir is not None
+        torchplus.train.try_restore_latest_checkpoints(model_dir, [net])
+    else:
+        torchplus.train.restore(ckpt_path, net)
+    batch_size = batch_size or input_cfg.batch_size
+    eval_dataset = input_reader_builder.build(
+        input_cfg,
+        model_cfg,
+        training=False,
+        voxel_generator=voxel_generator,
+        target_assigner=target_assigner)
+    eval_dataloader = torch.utils.data.DataLoader(
+        eval_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=input_cfg.preprocess.num_workers,
+        pin_memory=False,
+        collate_fn=merge_second_batch)
+
+    if train_cfg.enable_mixed_precision:
+        float_dtype = torch.float16
+    else:
+        float_dtype = torch.float32
+
+    net.eval()
+    result_path_step = result_path / f"step_{net.get_global_step()}"
+    result_path_step.mkdir(parents=True, exist_ok=True)
+    t = time.time()
+    detections = []
+    print("Generate output labels...")
+    bar = ProgressBar()
+    bar.start((len(eval_dataset) + batch_size - 1) // batch_size)
+    prep_example_times = []
+    prep_times = []
+    t2 = time.time()
+
+    for example in iter(eval_dataloader):
+        if measure_time:
+            prep_times.append(time.time() - t2)
+            torch.cuda.synchronize()
+            t1 = time.time()
+        example = example_convert_to_torch(example, float_dtype)
+        if measure_time:
+            torch.cuda.synchronize()
+            prep_example_times.append(time.time() - t1)
+        with torch.no_grad():
+            detections += net(example)
+        bar.print_bar()
+        if measure_time:
+            t2 = time.time()
+
+    sec_per_example = len(eval_dataset) / (time.time() - t)
+    print(f'generate label finished({sec_per_example:.2f}/s). start eval:')
+    if measure_time:
+        print(
+            f"avg example to torch time: {np.mean(prep_example_times) * 1000:.3f} ms"
+        )
+        print(f"avg prep time: {np.mean(prep_times) * 1000:.3f} ms")
+    for name, val in net.get_avg_time_dict().items():
+        print(f"avg {name} time = {val * 1000:.3f} ms")
+    with open(result_path_step / "result.pkl", 'wb') as f:
+        pickle.dump(detections, f)
+    #result_dict = eval_dataset.dataset.evaluation(detections,
+    #                                              str(result_path_step))
+    #if result_dict is not None:
+    #    for k, v in result_dict["results"].items():
+    #        print("Evaluation {}".format(k))
+    #        print(v)
     pass
 
 

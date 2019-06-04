@@ -199,9 +199,9 @@ class SpMiddleFHD(nn.Module):
         ret = spconv.SparseConvTensor(voxel_features, coors, self.sparse_shape,
                                       batch_size)
         # t = time.time()
-        # torch.cuda.synchronize()
+        torch.cuda.synchronize()
         ret = self.middle_conv(ret)
-        # torch.cuda.synchronize()
+        torch.cuda.synchronize()
         # print("spconv forward time", time.time() - t)
         ret = ret.dense()
 

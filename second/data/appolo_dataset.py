@@ -1,9 +1,16 @@
+import os
+import sys
 from pathlib import Path
 import pickle
 import time
 from functools import partial
+import open3d
 
+from random import shuffle
 import numpy as np
+from glob import glob
+import fire
+
 
 from second.core import box_np_ops
 from second.core import preprocess as prep
@@ -12,8 +19,10 @@ from second.utils.eval import get_coco_eval_result, get_official_eval_result
 from second.data.dataset import Dataset, register_dataset
 from second.utils.progress_bar import progress_bar_iter as prog_bar
 
+CLASS_LABELS = ["", "Car", "Van", "Pedestrian", "Cyclist", "DontCare", "DontCare"]
+
 @register_dataset
-class KittiDataset(Dataset):
+class AppoloDataset(Dataset):
     NumPointFeatures = 4
 
     def __init__(self,
@@ -23,9 +32,11 @@ class KittiDataset(Dataset):
                  prep_func=None,
                  num_point_features=None):
         assert info_path is not None
+        print("LOAD DATASET:", info_path)
+        print("CLASS_NAMES", class_names)
         with open(info_path, 'rb') as f:
             infos = pickle.load(f)
-        self._root_path = Path(root_path)
+        #self._root_path = Path(root_path)
         self._kitti_infos = infos
 
         print("remain number of infos:", len(self._kitti_infos))
@@ -162,8 +173,9 @@ class KittiDataset(Dataset):
 
     def __getitem__(self, idx):
         input_dict = self.get_sensor_data(idx)
+
         example = self._prep_func(input_dict=input_dict)
-        example["metadata"] = {}
+        example["metadata"] = {'pcd_path': self._kitti_infos[idx]["point_cloud"]['velodyne_path']}
         if "image_idx" in input_dict["metadata"]:
             example["metadata"] = input_dict["metadata"]
         if "anchors_mask" in example:
@@ -174,206 +186,185 @@ class KittiDataset(Dataset):
         read_image = False
         idx = query
         if isinstance(query, dict):
+            assert False
+            '''
             read_image = "cam" in query
             assert "lidar" in query
             idx = query["lidar"]["idx"]
+            '''
         info = self._kitti_infos[idx]
+        pc_info = info["point_cloud"]
+        velo_path = pc_info['velodyne_path']
+
         res = {
+                "metadata": {},
             "lidar": {
                 "type": "lidar",
                 "points": None,
             },
-            "metadata": {
-                "image_idx": info["image"]["image_idx"],
-                "image_shape": info["image"]["image_shape"],
-            },
-            "calib": None,
-            "cam": {}
         }
 
-        pc_info = info["point_cloud"]
-        velo_path = Path(pc_info['velodyne_path'])
-        if not velo_path.is_absolute():
-            velo_path = Path(self._root_path) / pc_info['velodyne_path']
-        velo_reduced_path = velo_path.parent.parent / (
-            velo_path.parent.stem + '_reduced') / velo_path.name
-        if velo_reduced_path.exists():
-            velo_path = velo_reduced_path
+        #assert velo_path.is_absolute()
+
+        if True:    # load PCD
+            print('LOADING', velo_path)
+            pcd = open3d.read_point_cloud(velo_path)
+            print(pcd)
+            pcd_pp = np.asarray(pcd.points)
+            pcd_cc = np.asarray(pcd.intensity)[:, np.newaxis]
+            points = np.concatenate([pcd_pp, pcd_cc], axis=1)
+            points = points.astype(np.float32)
+            pass
+
+        '''
         points = np.fromfile(
             str(velo_path), dtype=np.float32,
             count=-1).reshape([-1, self.NumPointFeatures])
+        '''
         res["lidar"]["points"] = points
-        image_info = info["image"]
-        image_path = image_info['image_path']
-        if read_image:
-            image_path = self._root_path / image_path
-            with open(str(image_path), 'rb') as f:
-                image_str = f.read()
-            res["cam"] = {
-                "type": "camera",
-                "data": image_str,
-                "datatype": image_path.suffix[1:],
-            }
-        calib = info["calib"]
-        calib_dict = {
-            'rect': calib['R0_rect'],
-            'Trv2c': calib['Tr_velo_to_cam'],
-            'P2': calib['P2'],
-        }
-        res["calib"] = calib_dict
         if 'annos' in info:
             annos = info['annos']
             # we need other objects to avoid collision when sample
-            annos = kitti.remove_dontcare(annos)
-            locs = annos["location"]
-            dims = annos["dimensions"]
-            rots = annos["rotation_y"]
-            gt_names = annos["name"]
+            # annos = kitti.remove_dontcare(annos)
+            gt_boxes = np.array(annos['boxes'], dtype=np.float32)
+            gt_names = np.array(annos["name"])
             # rots = np.concatenate([np.zeros([locs.shape[0], 2], dtype=np.float32), rots], axis=1)
-            gt_boxes = np.concatenate([locs, dims, rots[..., np.newaxis]],
-                                      axis=1).astype(np.float32)
-            calib = info["calib"]
-            gt_boxes = box_np_ops.box_camera_to_lidar(
-                gt_boxes, calib["R0_rect"], calib["Tr_velo_to_cam"])
-
+            #gt_boxes = np.concatenate([locs, dims, rots[..., np.newaxis]],
+            #                          axis=1).astype(np.float32)
             # only center format is allowed. so we need to convert
             # kitti [0.5, 0.5, 0] center to [0.5, 0.5, 0.5]
-            box_np_ops.change_box3d_center_(gt_boxes, [0.5, 0.5, 0],
-                                            [0.5, 0.5, 0.5])
+
+            #box_np_ops.change_box3d_center_(gt_boxes, [0.5, 0.5, 0],
+            #                                [0.5, 0.5, 0.5])
+            assert len(gt_names) == gt_boxes.shape[0]
             res["lidar"]["annotations"] = {
                 'boxes': gt_boxes,
                 'names': gt_names,
             }
-            res["cam"]["annotations"] = {
-                'boxes': annos["bbox"],
-                'names': gt_names,
-            }
+
+        anno_dict = res["lidar"]["annotations"]
+        assert(anno_dict["boxes"].shape[0] == len(anno_dict["names"]))
 
         return res
 
 
-def convert_to_kitti_info_version2(info):
-    """convert kitti info v1 to v2 if possible.
-    """
-    if "image" not in info or "calib" not in info or "point_cloud" not in info:
-        info["image"] = {
-            'image_shape': info["img_shape"],
-            'image_idx': info['image_idx'],
-            'image_path': info['img_path'],
-        }
-        info["calib"] = {
-            "R0_rect": info['calib/R0_rect'],
-            "Tr_velo_to_cam": info['calib/Tr_velo_to_cam'],
-            "P2": info['calib/P2'],
-        }
-        info["point_cloud"] = {
-            "velodyne_path": info['velodyne_path'],
-        }
-
-
-def kitti_anno_to_label_file(annos, folder):
-    folder = Path(folder)
-    for anno in annos:
-        image_idx = anno["metadata"]["image_idx"]
-        label_lines = []
-        for j in range(anno["bbox"].shape[0]):
-            label_dict = {
-                'name': anno["name"][j],
-                'alpha': anno["alpha"][j],
-                'bbox': anno["bbox"][j],
-                'location': anno["location"][j],
-                'dimensions': anno["dimensions"][j],
-                'rotation_y': anno["rotation_y"][j],
-                'score': anno["score"][j],
-            }
-            label_line = kitti.kitti_result_line(label_dict)
-            label_lines.append(label_line)
-        label_file = folder / f"{kitti.get_image_index_str(image_idx)}.txt"
-        label_str = '\n'.join(label_lines)
-        with open(label_file, 'w') as f:
-            f.write(label_str)
-
-
-def _read_imageset_file(path):
-    with open(path, 'r') as f:
-        lines = f.readlines()
-    return [int(line) for line in lines]
-
-
 def _calculate_num_points_in_gt(data_path,
                                 infos,
-                                relative_path,
                                 remove_outside=True,
                                 num_features=4):
     for info in infos:
         pc_info = info["point_cloud"]
-        image_info = info["image"]
-        calib = info["calib"]
-        if relative_path:
-            v_path = str(Path(data_path) / pc_info["velodyne_path"])
-        else:
-            v_path = pc_info["velodyne_path"]
-        points_v = np.fromfile(
-            v_path, dtype=np.float32, count=-1).reshape([-1, num_features])
-        rect = calib['R0_rect']
-        Trv2c = calib['Tr_velo_to_cam']
-        P2 = calib['P2']
-        if remove_outside:
-            points_v = box_np_ops.remove_outside_points(
-                points_v, rect, Trv2c, P2, image_info["image_shape"])
+        v_path = pc_info["velodyne_path"]
+        if True:
+            pcd = open3d.read_point_cloud(v_path)
+            points_v = np.asarray(pcd.points).astype(np.float32)
+
+        #points_v = np.fromfile(
+        #    v_path, dtype=np.float32, count=-1).reshape([-1, num_features])
 
         # points_v = points_v[points_v[:, 0] > 0]
         annos = info['annos']
-        num_obj = len([n for n in annos['name'] if n != 'DontCare'])
+        num_obj = len(annos['name']) #len([n for n in annos['name'] if n != 'DontCare'])
         # annos = kitti.filter_kitti_anno(annos, ['DontCare'])
-        dims = annos['dimensions'][:num_obj]
-        loc = annos['location'][:num_obj]
-        rots = annos['rotation_y'][:num_obj]
-        gt_boxes_camera = np.concatenate([loc, dims, rots[..., np.newaxis]],
-                                         axis=1)
-        gt_boxes_lidar = box_np_ops.box_camera_to_lidar(
-            gt_boxes_camera, rect, Trv2c)
-        indices = box_np_ops.points_in_rbbox(points_v[:, :3], gt_boxes_lidar)
+        gt_boxes = np.array(annos['boxes'], dtype=np.float32)
+
+        #gt_boxes_camera = np.concatenate([loc, dims, rots[..., np.newaxis]],
+        #                                 axis=1)
+        #gt_boxes_lidar = box_np_ops.box_camera_to_lidar(
+        #    gt_boxes_camera, rect, Trv2c)
+        indices = box_np_ops.points_in_rbbox(points_v, gt_boxes)
         num_points_in_gt = indices.sum(0)
-        num_ignored = len(annos['dimensions']) - num_obj
-        num_points_in_gt = np.concatenate(
-            [num_points_in_gt, -np.ones([num_ignored])])
+        #num_ignored = len(annos['dimensions']) - num_obj
+        #num_points_in_gt = np.concatenate(
+        #    [num_points_in_gt, -np.ones([num_ignored])])
         annos["num_points_in_gt"] = num_points_in_gt.astype(np.int32)
+        pass
+
+def get_appolo_image_info (training, stems):
+    infos = []
+    for stem in stems:
+        frames = {}
+        for pcd_path in glob(stem + "_frame/*.pcd"):
+            bn = os.path.basename(pcd_path)
+            frame = int(bn.split('.')[0])
+            info = {
+                    "point_cloud": {
+                            "velodyne_path": pcd_path
+                        },
+                    "annos": {
+                            "boxes": [],
+                            "name": [],
+                            "wdong_cnt": 0
+                        }
+                            
+                    }
+            frames[frame] = info
+            pass
+        if training:
+            with open(stem + '.txt', 'r') as f:
+                for line in f:
+                    fs = line.strip().split(' ')
+                    assert len(fs) == 9
+                    frame = int(fs[0])
+
+                    assert frame in frames
+                    info = frames[frame]
+                    category = int(fs[1])
+                    assert category > 0
+                    if category <= 4:
+                        info["annos"]["wdong_cnt"] += 1
+                    info["annos"]["name"].append(CLASS_LABELS[category])
+                    info["annos"]["boxes"].append([float(x) for x in fs[2:]])
+                    pass
+                pass
+            # read labels
+            pass
+        for k, info in frames.items():
+            assert len(info["annos"]["name"]) == len(info["annos"]["boxes"])
+            #if info["annos"]["wdong_cnt"] == 0 and training:
+            #    continue
+            infos.append(info)
+            pass
+        pass
+    print("got %d images" % len(infos))
+    return infos
 
 
-def create_kitti_info_file(data_path, save_path=None, relative_path=True):
-    imageset_folder = Path(__file__).resolve().parent / "ImageSets"
-    train_img_ids = _read_imageset_file(str(imageset_folder / "train.txt"))
-    val_img_ids = _read_imageset_file(str(imageset_folder / "val.txt"))
-    test_img_ids = _read_imageset_file(str(imageset_folder / "test.txt"))
+def create_kitti_info_file(data_path, save_path=None):
+    train_dirs = [x.replace("_frame", "") for x in glob(data_path + "/train/*_frame")]
+    shuffle(train_dirs)
+    split = 5
+    n_val = len(train_dirs) // split
+    print("Loading %d dirs" % len(train_dirs))
+    val_dirs = train_dirs[:n_val]
+    train_dirs = train_dirs[n_val:]
+    test_dirs = [x.replace("_frame", "") for x in glob(data_path + "/test/*_frame")]
+    print("# train dirs: %d" % len(train_dirs))
+    print("# val dirs: %d" % len(val_dirs))
+    print("# test dirs: %d" % len(test_dirs))
+
 
     print("Generate info. this may take several minutes.")
     if save_path is None:
         save_path = Path(data_path)
     else:
         save_path = Path(save_path)
-    kitti_infos_train = kitti.get_kitti_image_info(
-        data_path,
-        training=True,
-        velodyne=True,
-        calib=True,
-        image_ids=train_img_ids,
-        relative_path=relative_path)
-    _calculate_num_points_in_gt(data_path, kitti_infos_train, relative_path)
+    kitti_infos_test = get_appolo_image_info(False, test_dirs)
+    filename = save_path / 'kitti_infos_test.pkl'
+    print(f"Kitti info test file (%d) is saved to {filename}" % len(kitti_infos_test))
+    with open(filename, 'wb') as f:
+        pickle.dump(kitti_infos_test, f)
+
+    kitti_infos_train = get_appolo_image_info(True, train_dirs)
+    #_calculate_num_points_in_gt(data_path, kitti_infos_train)
     filename = save_path / 'kitti_infos_train.pkl'
-    print(f"Kitti info train file is saved to {filename}")
+    print(f"Kitti info train file (%d) is saved to {filename}" % len(kitti_infos_train))
     with open(filename, 'wb') as f:
         pickle.dump(kitti_infos_train, f)
-    kitti_infos_val = kitti.get_kitti_image_info(
-        data_path,
-        training=True,
-        velodyne=True,
-        calib=True,
-        image_ids=val_img_ids,
-        relative_path=relative_path)
-    _calculate_num_points_in_gt(data_path, kitti_infos_val, relative_path)
+    kitti_infos_val = get_appolo_image_info(True, val_dirs)
+    #_calculate_num_points_in_gt(data_path, kitti_infos_val)
     filename = save_path / 'kitti_infos_val.pkl'
-    print(f"Kitti info val file is saved to {filename}")
+    print(f"Kitti info val file (%d) is saved to {filename}" % len(kitti_infos_val))
     with open(filename, 'wb') as f:
         pickle.dump(kitti_infos_val, f)
     filename = save_path / 'kitti_infos_trainval.pkl'
@@ -381,84 +372,12 @@ def create_kitti_info_file(data_path, save_path=None, relative_path=True):
     with open(filename, 'wb') as f:
         pickle.dump(kitti_infos_train + kitti_infos_val, f)
 
-    kitti_infos_test = kitti.get_kitti_image_info(
-        data_path,
-        training=False,
-        label_info=False,
-        velodyne=True,
-        calib=True,
-        image_ids=test_img_ids,
-        relative_path=relative_path)
+    kitti_infos_test = get_appolo_image_info(False, test_dirs)
     filename = save_path / 'kitti_infos_test.pkl'
     print(f"Kitti info test file is saved to {filename}")
     with open(filename, 'wb') as f:
         pickle.dump(kitti_infos_test, f)
 
 
-def _create_reduced_point_cloud(data_path,
-                                info_path,
-                                save_path=None,
-                                back=False):
-    with open(info_path, 'rb') as f:
-        kitti_infos = pickle.load(f)
-    for info in prog_bar(kitti_infos):
-        pc_info = info["point_cloud"]
-        image_info = info["image"]
-        calib = info["calib"]
-
-        v_path = pc_info['velodyne_path']
-        v_path = Path(data_path) / v_path
-        points_v = np.fromfile(
-            str(v_path), dtype=np.float32, count=-1).reshape([-1, 4])
-        rect = calib['R0_rect']
-        P2 = calib['P2']
-        Trv2c = calib['Tr_velo_to_cam']
-        # first remove z < 0 points
-        # keep = points_v[:, -1] > 0
-        # points_v = points_v[keep]
-        # then remove outside.
-        if back:
-            points_v[:, 0] = -points_v[:, 0]
-        points_v = box_np_ops.remove_outside_points(points_v, rect, Trv2c, P2,
-                                                    image_info["image_shape"])
-        if save_path is None:
-            save_filename = v_path.parent.parent / (
-                v_path.parent.stem + "_reduced") / v_path.name
-            # save_filename = str(v_path) + '_reduced'
-            if back:
-                save_filename += "_back"
-        else:
-            save_filename = str(Path(save_path) / v_path.name)
-            if back:
-                save_filename += "_back"
-        with open(save_filename, 'w') as f:
-            points_v.tofile(f)
-
-
-def create_reduced_point_cloud(data_path,
-                               train_info_path=None,
-                               val_info_path=None,
-                               test_info_path=None,
-                               save_path=None,
-                               with_back=False):
-    if train_info_path is None:
-        train_info_path = Path(data_path) / 'kitti_infos_train.pkl'
-    if val_info_path is None:
-        val_info_path = Path(data_path) / 'kitti_infos_val.pkl'
-    if test_info_path is None:
-        test_info_path = Path(data_path) / 'kitti_infos_test.pkl'
-
-    _create_reduced_point_cloud(data_path, train_info_path, save_path)
-    _create_reduced_point_cloud(data_path, val_info_path, save_path)
-    _create_reduced_point_cloud(data_path, test_info_path, save_path)
-    if with_back:
-        _create_reduced_point_cloud(
-            data_path, train_info_path, save_path, back=True)
-        _create_reduced_point_cloud(
-            data_path, val_info_path, save_path, back=True)
-        _create_reduced_point_cloud(
-            data_path, test_info_path, save_path, back=True)
-
-
 if __name__ == "__main__":
-    pass
+    fire.Fire()

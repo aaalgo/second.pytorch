@@ -112,6 +112,7 @@ class TargetAssigner:
                 return self._sim_calcs[anchor_gene_idx].compare(
                     anchors_rbv, gt_boxes_rbv)
 
+            assert len(gt_names) == gt_boxes.shape[0], 'len(gt_names) %d == gt_boxes.shape[0] %d' % (len(gt_names), gt_boxes.shape[0])
             mask = np.array([c == class_name for c in gt_names],
                             dtype=np.bool_)
             feature_map_size = anchor_dict["anchors"].shape[:3]
