@@ -203,16 +203,20 @@ class AppoloDataset(Dataset):
                 "points": None,
             },
         }
-
+        
         #assert velo_path.is_absolute()
 
         if True:    # load PCD
-            print('LOADING', velo_path)
             pcd = open3d.read_point_cloud(velo_path)
-            print(pcd)
             pcd_pp = np.asarray(pcd.points)
             pcd_cc = np.asarray(pcd.intensity)[:, np.newaxis]
-            points = np.concatenate([pcd_pp, pcd_cc], axis=1)
+            try:
+                points = np.concatenate([pcd_pp, pcd_cc], axis=1)
+            except:
+                print("FAIL TO LOAD", velo_path)
+                points = np.zeros([0, 4])
+                #print(pcd_pp.shape, pcd_cc.shape)
+                pass
             points = points.astype(np.float32)
             pass
 
